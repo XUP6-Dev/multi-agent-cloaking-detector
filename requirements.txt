@@ -1,0 +1,26 @@
+# ── Core (Python 3.12 相容版本) ──────────────────────────
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-community>=0.3.0
+
+# ── LLM Backend（以 LLM_PROVIDER 環境變數切換）─────────────
+#   deepseek（預設）/ openai → langchain-openai
+#   anthropic               → langchain-anthropic
+#   google                  → langchain-google-genai
+# 只需安裝實際會用到的那個；main.py 採延遲 import，缺套件會提示而非崩潰。
+langchain-openai>=0.2.0
+langchain-anthropic>=0.3.0     # Claude（claude-opus-5 / claude-sonnet-5 / claude-haiku-4-5）
+langchain-google-genai>=2.0.0  # Gemini
+python-dotenv       # 讀取同目錄 .env 內的 API key
+
+# ── Web Scraping ─────────────────────────────────────────
+requests
+beautifulsoup4
+playwright          # 安裝後需執行: playwright install chromium
+
+# ── JS Deobfuscation ─────────────────────────────────────
+jsbeautifier        # js-beautify Python binding
+# de4js: npm install -g de4js  (Node.js CLI, 選用)
+
+# ── UI / Progress ─────────────────────────────────────────
+rich                # 進度條與彩色輸出
