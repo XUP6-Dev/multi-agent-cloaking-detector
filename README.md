@@ -20,11 +20,11 @@
 ## Pipeline
 
 ```mermaid
-flowchart TD
+flowchart LR
     URL(["URL"]) --> N1
 
     subgraph N1["Node 1 · 雙重爬取（並行，錯開 2–4 秒）"]
-        direction LR
+        direction TB
         BOT["BOT 身分\nGooglebot UA・webdriver=true\nplugins=[]・無 Accept-Language"]
         HUMAN["HUMAN 身分\nChrome UA・15 項 stealth 修補\n貝茲曲線滑鼠・Google session 預熱"]
     end
