@@ -20,7 +20,7 @@
 ## Pipeline
 
 ```mermaid
-flowchart LR
+flowchart TD
     URL(["URL"]) --> N1
 
     subgraph N1["Node 1 · 雙重爬取（並行，錯開 2–4 秒）"]
