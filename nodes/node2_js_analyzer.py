@@ -352,5 +352,3 @@ def analyze_js_node(state: AnalysisState, llm) -> AnalysisState:
     state["deobfuscated_js"] = deobfuscated
     print(f"  → 去混淆完成: {len(deobfuscated)} 個腳本")
     return state
-
-    return state

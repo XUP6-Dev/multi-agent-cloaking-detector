@@ -27,7 +27,6 @@ node4_cloaking_analyzer.py  分析（靜態偵測 → 動態雙瀏覽器驗證�
      讓初始 HTTP 請求的 JA3/JA4 指紋與真實 Chrome 一致，
      取代 python-requests 的 Python TLS 指紋
 """
-import os
 import sys as _sys
 import os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
@@ -89,6 +88,51 @@ _COND_FINGERPRINT = {           # pattern 內部已含 bot 條件，本身就是
 _EVASION_ACTIONS = {            # 依偵測結果改變行為
     "javascript_redirect", "time_based_evasion",
 }
+
+# ── 互動閘門：不是 cloaking 證據，是「我們可能沒看到真正內容」的證據 ──────
+# CrawlPhish (IEEE S&P 2021) Table V 統計，User Interaction 類佔客戶端 cloaking
+# 實作的 57.60%（ClickThrough 22.11% / Alert 17.19% / MouseDetection 16.53% /
+# Notification 4.34%）。爬蟲跨不過去的閘門對 BOT 和 HUMAN 是「對稱」的 ——
+# 兩邊都只看到閘門前的無害頁，機制集合差為空。
+#
+# 若不特別處理，這種情況會走到 dynamic_reliability=HIGH（HUMAN 端爬取本身很健康：
+# 有內容、耗時夠久、prewarm 成功），Node 5 因而輸出 cloaking=False，
+# 等於主動宣稱「驗過了，確認沒有 cloaking」—— 但我們其實連內容都沒看到。
+# 三態輸出的意義就在於區分「驗過沒有」和「沒驗到」，這裡必須降級成後者。
+#
+# HUMAN 端現在會嘗試跨越 click / alert 類閘門（dual_crawler._cross_gates），
+# 跨過去的就不該再算成「沒看到」；CAPTCHA 一律跨不過（也刻意不去破解），
+# 所以永遠算未跨越。
+_GATE_PATTERNS = {
+    "captcha":      re.compile(r"g-recaptcha|h-?captcha|cf-turnstile|recaptcha/api\.js", re.I),
+    "notification": re.compile(r"Notification\s*\.\s*requestPermission", re.I),
+    "click_gate":   re.compile(
+        r"onclick[^>]{0,80}(display\s*=\s*['\"]block|removeAttribute\(\s*['\"]hidden)", re.I),
+    "alert_gate":   re.compile(r"\balert\s*\(", re.I),
+}
+
+# 哪一種跨越動作解掉哪一種閘門（CAPTCHA 不在此表 —— 永遠解不掉）
+_GATE_RESOLVED_BY = {
+    "click_gate": "click:",
+    "alert_gate": "dialog_auto_accept",
+}
+
+
+def _detect_gates(html: str, gate_crossed=None) -> list:
+    """
+    回傳頁面中**仍未跨越**的互動閘門種類。
+
+    gate_crossed: dual_crawler 回報的 HUMAN 端跨越動作清單。
+                  已經跨過去的閘門就不算「沒看到內容」，不應再拖低可信度 ——
+                  否則加了跨閘門功能反而讓更多案例掉進 N/A，等於做白工。
+    """
+    if not html:
+        return []
+    found = {name for name, pat in _GATE_PATTERNS.items() if pat.search(html)}
+    for gate, marker in _GATE_RESOLVED_BY.items():
+        if gate in found and any(str(a).startswith(marker) for a in (gate_crossed or [])):
+            found.discard(gate)
+    return sorted(found)
 
 # (id, [(分組, 最少命中類別數), ...], 說明)
 STATIC_CLOAKING_RULES = [
@@ -351,22 +395,28 @@ def _redirect_forked(chain_a: list, chain_b: list) -> bool:
     return bool(chain_a and chain_b and domain(chain_a[-1]) != domain(chain_b[-1]))
 
 
-def _assess_dynamic_reliability(bot_result: dict, human_result: dict) -> str:
+def _assess_dynamic_reliability(bot_result: dict, human_result: dict,
+                                 no_mechanisms: bool = False) -> str:
     """
     評估這次動態爬取結果的可信度。
 
     回傳三個等級:
       "HIGH"        — HUMAN 瀏覽器確實以正常用戶身份完成訪問，結果可信
                       → 若兩頁面相同，可以確認「無 Cloaking」
-      "LOW"         — HUMAN 爬取流程有缺陷 (預熱失敗 / 載入過快)，
+      "LOW"         — HUMAN 爬取流程有缺陷 (預熱失敗 / 載入過快 / 停在互動閘門前)，
                       頁面相同可能只代表兩者都被識破，不能確認無 Cloaking
       "FAILED"      — BOT 或 HUMAN 其中一方完全失敗，無法進行有效比對
 
-    判斷依據（v2 三段式）:
+    判斷依據（v3 四段式）:
       FAILED  : 任一方有 error，或兩方 text_content 都是空的，
                 或 HUMAN 耗時 < 3s（頁面根本未完整載入，JS fingerprint 未執行）
-      LOW     : HUMAN 預熱失敗，或耗時 < 6s（prewarm ~2-4s + JS ~1-2s，合計至少 6s）
+      LOW     : HUMAN 預熱失敗，或耗時 < 6s（prewarm ~2-4s + JS ~1-2s，合計至少 6s），
+                或【v3 新增】兩端都沒有機制但頁面存在未跨越的互動閘門
       HIGH    : 以上都不成立
+
+    no_mechanisms: 兩端 evaluate_page 都沒測到任何惡意機制。
+                   單看這個參數不足以降級 —— 乾淨的網站本來就沒有機制，
+                   必須同時存在互動閘門，才代表「可能沒看到真正的內容」。
     """
     if bot_result.get("error") or human_result.get("error"):
         return "FAILED"
@@ -381,6 +431,11 @@ def _assess_dynamic_reliability(bot_result: dict, human_result: dict) -> str:
         return "LOW"
     # < 6s：prewarm(2-4s) + JS fingerprint(1-2s)，不足以確認通過所有檢查
     if human_time < 6.0:
+        return "LOW"
+    # 互動閘門：爬蟲不點擊、不關 alert、不解 CAPTCHA，兩端都停在閘門前面。
+    # 這種「對稱的看不到」不能當成「對稱的沒有惡意」。
+    if no_mechanisms and _detect_gates(human_result.get("html", ""),
+                                       human_result.get("gate_crossed")):
         return "LOW"
     return "HIGH"
 
@@ -471,6 +526,45 @@ def decide_cloaking(bot_result: dict, human_result: dict, url: str) -> dict:
     }
 
 
+def _confirm_c1(url: str, bot_mech: set, hidden_from_bot: list,
+                verified: bool, evidence: list) -> tuple:
+    """
+    C1 陽性確認：重爬一次 HUMAN，檢查「只給真人看的機制」是否穩定重現。
+
+    要擋掉的誤判：頁面自身的自然變動（輪播廣告、A/B test、個人化推薦、
+    只在部分載入才出現的第三方腳本）可能讓某個機制剛好只出現在 HUMAN 那次，
+    看起來像 cloaking，其實只是同一頁兩次載入就會不一樣。
+
+    回傳 (verified, evidence)。重爬失敗時保守維持原判定並註記 ——
+    確認機制的目的是擋誤判，不該因為網路問題反而把真陽性抹掉。
+    """
+    from nodes.dual_crawler import crawl_human_only
+
+    print("  → [C1 確認] 重爬 HUMAN 一次，檢查機制是否穩定重現...", flush=True)
+    second = crawl_human_only(url)
+    if second.get("error") or not second.get("html"):
+        evidence.append(
+            f"[C1 確認] 重爬失敗（{second.get('error') or '無內容'}）→ "
+            f"無法確認，保守維持原判定"
+        )
+        print("  → [C1 確認] 重爬失敗，維持原判定", flush=True)
+        return verified, evidence
+
+    mech_2nd = evaluate_page(second["html"], url)["mechanisms"]
+    stable   = sorted((mech_2nd - bot_mech) & set(hidden_from_bot))
+    if stable:
+        evidence.append(f"[C1 確認] 機制經第二次 HUMAN 爬取確認穩定重現: {stable}")
+        print(f"  → [C1 確認] 穩定重現 {stable}，維持 Cloaking 判定", flush=True)
+        return True, evidence
+
+    evidence.append(
+        f"[C1 確認] 機制 {hidden_from_bot} 未在第二次 HUMAN 爬取重現 → "
+        f"判為頁面自身變異（輪播/A-B test/個人化），非 Cloaking"
+    )
+    print(f"  → [C1 確認] 未重現，撤銷 Cloaking 判定（頁面自身變異）", flush=True)
+    return False, evidence
+
+
 def _dynamic_verify(state: AnalysisState, static_detected: bool) -> tuple:
     """
     比對 Node 1 已取得的兩份頁面，回傳 (verified, dual_results, errors, dynamic_reliability)
@@ -535,13 +629,37 @@ def _dynamic_verify(state: AnalysisState, static_detected: bool) -> tuple:
     # ── 動態可信度評估 ────────────────────────────────────
     # 這裡解決「動態沒驗到 ≠ 動態確認沒有」的根本問題：
     #   HIGH   → HUMAN 確實以正常用戶身份完成，頁面相同 = 真的沒有 Cloaking
-    #   LOW    → HUMAN 預熱失敗或載入過快，頁面相同只代表兩者都被識破，結果不可信
+    #   LOW    → HUMAN 預熱失敗 / 載入過快 / 停在互動閘門前，結果不可信
     #   FAILED → 任一方失敗，無法比對
     # fetch_time_sec 已由各 thread wrapper 寫入 result dict
-    dynamic_reliability = _assess_dynamic_reliability(bot_result, human_result)
+    no_mechanisms = not bot_mech and not human_mech
+    dynamic_reliability = _assess_dynamic_reliability(
+        bot_result, human_result, no_mechanisms=no_mechanisms)
+    gates = (_detect_gates(human_result.get("html", ""),
+                           human_result.get("gate_crossed"))
+             if no_mechanisms else [])
+    if gates:
+        evidence.append(
+            f"[觀察] 兩端皆無惡意機制，但頁面存在未跨越的互動閘門 {gates} → "
+            f"可能停在閘門前未取得真正內容，不宣稱「確認無 Cloaking」"
+        )
     print(f"  → 動態可信度: {dynamic_reliability}"
-          + (" (預熱失敗，結果不可信)" if dynamic_reliability == "LOW" else "")
+          + (f" (互動閘門 {gates}，可能未取得真正內容)" if gates else "")
+          + (" (預熱失敗，結果不可信)"
+             if dynamic_reliability == "LOW" and not gates else "")
           + (" (爬取失敗)" if dynamic_reliability == "FAILED" else ""))
+
+    # ── 陽性確認：C1 單獨成立時重爬一次 HUMAN ────────────────────
+    # 只有 C1 依賴「單次觀測到的機制」這種可能不穩定的證據；
+    # C2–C5 依據的是狀態碼 / 傳輸層錯誤 / 空頁面 / redirect 鏈，都是當次事實，
+    # 重爬並不會讓它們更可信，所以不浪費那次爬取。
+    #
+    # 對照 Cloak of Visibility (S&P'16)：他們每個 profile 全量爬 3 次，用同 profile
+    # 內的變異去正規化跨 profile 的差異。因為我們比的是離散機制集合而非連續相似度，
+    # 只需在「即將宣稱有 cloaking」時確認一次，成本從 3× 降為 1×陽性率。
+    if verified and fired == ["C1"] and dynamic_reliability != "FAILED":
+        verified, evidence = _confirm_c1(
+            url, bot_mech, hidden_from_bot, verified, evidence)
 
     # ── 結合靜態結果（僅描述，不再調整任何分數）──────────────
     if verified and static_detected:

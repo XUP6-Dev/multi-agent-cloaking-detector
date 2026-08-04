@@ -1,12 +1,11 @@
 """
-node1_scraper.py - Node 1: 抓取 JS
-靜態 (requests + BeautifulSoup) + 動態 (Playwright) 雙模式抓取
+node1_scraper.py - Node 1: 雙重爬取（BOT ‖ HUMAN）+ 抽取 JS
 
 設計定位：
-  Node1 使用「中性 UA」——既不像 Googlebot（BOT 模式），也不注入 stealth JS（HUMAN 模式）。
-  這使 raw_html 成為 Node4 三方基準比對的「中立參考點」。
-  Playwright 加入基本 UA 偽裝以避免被裸 headless 特徵立即拒絕，
-  但不注入 fingerprint 修補腳本，保持中性。
+  實際爬取由 dual_crawler.dual_crawl() 執行（BOT/HUMAN 兩個 Playwright 身分並行）。
+  本檔負責呼叫它、決定判定用頁面（優先 HUMAN）、從該頁面抽取 JS。
+  _NEUTRAL_UA / _STATIC_HEADERS 只用在兩件事：抓外部 JS 檔、雙 Playwright 都失敗時的
+  最後手段 _static_fallback()，不是第三種爬取身分。
 
 修正紀錄：
   v2 修正 1 (Bug): 動態 HTML 更新 raw_html 後，js_scripts 未同步更新
@@ -38,8 +37,7 @@ from nodes.dual_crawler import dual_crawl
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ── 常數 ──────────────────────────────────────────────────────
-# 中性 UA：比裸 requests 預設值更像真實瀏覽器，但不做完整 stealth 修補
-# （Node4 HUMAN 才做完整修補；Node1 保持中性供三方比對用）
+# 比裸 requests 預設值更像真實瀏覽器的 UA，供外部 JS 抓取與靜態 fallback 用
 _NEUTRAL_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -51,12 +49,6 @@ _STATIC_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
 }
-# Playwright 中性啟動參數：只抑制 AutomationControlled 旗標，不加 stealth JS
-_NEUTRAL_LAUNCH_ARGS = [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-blink-features=AutomationControlled",  # 修正 2：避免裸 headless 被立即拒絕
-]
 _INLINE_MIN_LEN = 50   # inline script 最小長度（字元），過短的通常是 analytics 片段
 _STATIC_TIMEOUT  = 15  # requests.get timeout
 _EXT_JS_TIMEOUT  = 10  # 單個外部 JS 抓取 timeout

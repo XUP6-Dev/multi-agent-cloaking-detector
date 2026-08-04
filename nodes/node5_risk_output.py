@@ -45,7 +45,9 @@ def _cloaking_verdict(state: AnalysisState):
     """回傳 True / False / "N/A" """
     dual = state.get("dual_crawl_results") or {}
     if not dual:
-        # Node 3 判定非釣魚 → 條件路由直接跳到 Node 5，從未做 cloaking 分析
+        # 圖是線性的，每個 URL 都會經過 Node 4，所以正常情況下 dual 一定有值。
+        # 走到這裡代表 Node 4 沒能產出比對結果（節點異常、雙爬取皆失敗），
+        # 屬於「未經測量」而非「測得為否」→ N/A。
         return CLOAKING_UNKNOWN
     if state.get("cloaking_verified"):
         return True

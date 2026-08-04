@@ -32,6 +32,25 @@ logger = logging.getLogger(__name__)
 # 範例: export CLOAKING_PROXY="http://user:pass@proxy.provider.com:8080"
 PROXY_URL: str = os.environ.get("CLOAKING_PROXY", "")
 
+# BOT / HUMAN 各自的出口，讓 IP 也成為極端化維度之一。
+#
+# 為什麼要拆開：形式模型把可觀測請求屬性定義為
+#   ℛ = UA × IP × Headers × TLS × JS_props × Behavior，
+# 並主張兩個身分在 ℛ 上「最大分離」。但只用單一 CLOAKING_PROXY 時，
+# 兩邊走同一個出口 IP —— IP 這個維度完全沒有分離，而 CrawlPhish 與
+# PhishParrot 都指出 IP-based cloaking 是最主流的手法之一。
+# 換句話說，不拆開的話「最大分離」這個假設在實作上是假的，
+# 純 IP 判別的 cloaking 對這個差分是全盲的（兩端拿到相同待遇 → 無差異 → 漏報）。
+#
+# 建議配置：BOT 走資料中心 IP（易被識別為爬蟲），HUMAN 走住宅 IP。
+# 未設定則各自 fallback 回 CLOAKING_PROXY，維持與舊設定相容。
+BOT_PROXY_URL: str   = os.environ.get("CLOAKING_PROXY_BOT",   PROXY_URL)
+HUMAN_PROXY_URL: str = os.environ.get("CLOAKING_PROXY_HUMAN", PROXY_URL)
+
+
+def _proxy_for(is_human: bool) -> str:
+    return HUMAN_PROXY_URL if is_human else BOT_PROXY_URL
+
 # ── 網路層：curl_cffi TLS 指紋偽裝（可選）────────────────────
 # 安裝: pip install curl_cffi
 # 啟用後 BOT 的初始 HTTP 請求 JA3/JA4 指紋與 Python requests 不同，
@@ -95,27 +114,111 @@ BOT_CONTEXT_OPTIONS = {
     # 刻意不設 geolocation → 讓 navigator.geolocation 行為異常
 }
 
-HUMAN_CONTEXT_OPTIONS = {
-    "user_agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0.0.0 Safari/537.36"
-    ),
-    "extra_http_headers": {
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT":             "1",
+# ── HUMAN profile 預設集 ─────────────────────────────────────
+# 為什麼要參數化：極端化處理的是「bot ↔ human」這條軸，但 PhishParrot
+# (IEEE GLOBECOM 2025) 實測攻擊者的 targeting 大量發生在「地理 / 平台」軸上
+# —— 觀察到 91 種不同的最佳 profile，其中日本住宅網路佔 53.83%、
+# 美國資料中心 30.71%、macOS Safari + 日本住宅 8.77%。
+# 這兩條軸是正交的：把 bot 特徵推到極端，不會讓一個「只服務日本行動用戶」的
+# kit 認為我們的台灣桌機 HUMAN 是目標；那種情況兩端都拿到 decoy，
+# 對稱 → 機制集合差為空 → 漏報。
+#
+# 因此本系統的主張不是「兩個 profile 就能觸及所有 cloaked 內容」，而是
+# 「一組極端化的配對是做出 cloaking 判定的最小單位」：profile 的『選擇』
+# 與 profile 的『差分』是可分離的，前者可由 PhishParrot 式的最佳化供給，
+# 後者（本系統）不受影響。這些預設值就是讓該主張可被實驗檢驗的旋鈕。
+_ACCEPT_HTML = (
+    "text/html,application/xhtml+xml,application/xml;"
+    "q=0.9,image/avif,image/webp,*/*;q=0.8"
+)
+_UA_WIN_CHROME = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+_UA_ANDROID_CHROME = (
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
+)
+_UA_MAC_SAFARI = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+)
+
+HUMAN_PROFILES = {
+    # 預設：與先前版本完全相同，換 profile 才會改變行為
+    "tw-desktop": {
+        "user_agent": _UA_WIN_CHROME,
+        "extra_http_headers": {
+            "Accept": _ACCEPT_HTML,
+            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+        },
+        "locale": "zh-TW", "timezone_id": "Asia/Taipei",
+        "viewport": {"width": 1440, "height": 900},
+        "geolocation": {"latitude": 25.033, "longitude": 121.565},
+        "permissions": ["geolocation"],
     },
-    "locale":      "zh-TW",
-    "timezone_id": "Asia/Taipei",
-    "viewport":    {"width": 1440, "height": 900},
-    "geolocation": {"latitude": 25.033, "longitude": 121.565},
-    "permissions": ["geolocation"],
+    # PhishParrot 觀察到的最大宗目標（日本住宅網路合計 53.83%）
+    "jp-mobile": {
+        "user_agent": _UA_ANDROID_CHROME,
+        "extra_http_headers": {
+            "Accept": _ACCEPT_HTML,
+            "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+        },
+        "locale": "ja-JP", "timezone_id": "Asia/Tokyo",
+        "viewport": {"width": 390, "height": 844},
+        "is_mobile": True, "has_touch": True, "device_scale_factor": 3,
+        "geolocation": {"latitude": 35.6895, "longitude": 139.6917},
+        "permissions": ["geolocation"],
+    },
+    "jp-desktop": {
+        "user_agent": _UA_WIN_CHROME,
+        "extra_http_headers": {
+            "Accept": _ACCEPT_HTML,
+            "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+        },
+        "locale": "ja-JP", "timezone_id": "Asia/Tokyo",
+        "viewport": {"width": 1440, "height": 900},
+        "geolocation": {"latitude": 35.6895, "longitude": 139.6917},
+        "permissions": ["geolocation"],
+    },
+    "us-desktop": {
+        "user_agent": _UA_WIN_CHROME,
+        "extra_http_headers": {
+            "Accept": _ACCEPT_HTML,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+        },
+        "locale": "en-US", "timezone_id": "America/New_York",
+        "viewport": {"width": 1920, "height": 1080},
+        "geolocation": {"latitude": 40.7128, "longitude": -74.0060},
+        "permissions": ["geolocation"],
+    },
+    # PhishParrot Table V 第四名（8.77%）：攻擊者對 Apple 用戶的偏好
+    "jp-mac-safari": {
+        "user_agent": _UA_MAC_SAFARI,
+        "extra_http_headers": {
+            "Accept": _ACCEPT_HTML,
+            "Accept-Language": "ja-JP,ja;q=0.9,en-US;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+        },
+        "locale": "ja-JP", "timezone_id": "Asia/Tokyo",
+        "viewport": {"width": 1512, "height": 982},
+        "geolocation": {"latitude": 35.6895, "longitude": 139.6917},
+        "permissions": ["geolocation"],
+    },
 }
+
+HUMAN_PROFILE_NAME = os.environ.get("HUMAN_PROFILE", "tw-desktop").lower()
+if HUMAN_PROFILE_NAME not in HUMAN_PROFILES:
+    logger.warning("未知的 HUMAN_PROFILE=%r，可用: %s；退回 tw-desktop",
+                   HUMAN_PROFILE_NAME, ", ".join(HUMAN_PROFILES))
+    HUMAN_PROFILE_NAME = "tw-desktop"
+
+HUMAN_CONTEXT_OPTIONS = HUMAN_PROFILES[HUMAN_PROFILE_NAME]
 
 # ── BOT 主動暴露腳本 ─────────────────────────────────────────
 # 與 HUMAN 的 _STEALTH_JS 相反：主動還原 / 強化 bot 特徵
@@ -151,9 +254,36 @@ Object.defineProperty(navigator, 'connection', {
 """
 
 _STEALTH_JS = r"""
+// ── 0. 原生函式偽裝（必須在所有修補之前執行）──────────────────
+// 依據 Amin Azad et al., "Taming the Shape Shifter: Detecting Anti-fingerprinting
+// Browsers" (2020)：JS 注入式的指紋偽裝可被 Function.prototype.toString 直接拆穿 ——
+// 原生函式回傳 "function x() { [native code] }"，而我們覆寫上去的 JS 函式會把
+// 整段原始碼吐出來。不補這一層，下面 17 個修補全部等於白做：攻擊者只要一行
+// Permissions.prototype.query.toString() 就知道這是自動化瀏覽器。
+(() => {
+    const _nativeToString = Function.prototype.toString;
+    const _masked = new WeakMap();
+    const patchedToString = function () {
+        if (_masked.has(this)) return _masked.get(this);
+        return _nativeToString.call(this);
+    };
+    // toString 自己也要偽裝，否則 Function.prototype.toString.toString() 露餡
+    _masked.set(patchedToString, 'function toString() { [native code] }');
+    Function.prototype.toString = patchedToString;
+    // 供下方修補使用；腳本結尾會刪除，避免自己留下比 webdriver 更明顯的指紋
+    window.__mask = (fn, name) => {
+        _masked.set(fn, 'function ' + name + '() { [native code] }');
+        return fn;
+    };
+})();
+// 綁進區域常數：下面有些 getter 是「存取時才執行」的（例如 navigator.plugins
+// 每次讀取都重建陣列），若它們在函式體內寫 window.__mask，等腳本結尾把
+// window.__mask 刪掉之後，那個 getter 一被存取就會 TypeError —— 整個
+// navigator.plugins 直接壞掉，比沒偽裝還明顯。改用閉包捕獲的區域常數就不受刪除影響。
+const _m = window.__mask;
 // ── 1. navigator.webdriver ────────────────────────────────────
 Object.defineProperty(navigator, 'webdriver', {
-    get: () => false,
+    get: _m(() => false, 'get webdriver'),
     configurable: true
 });
 
@@ -164,19 +294,19 @@ const _plugins = [
     { name: 'Native Client',           filename: 'internal-nacl-plugin',  description: '' },
 ];
 Object.defineProperty(navigator, 'plugins', {
-    get: () => {
+    get: _m(() => {
         const arr = Object.assign([], _plugins);
-        arr.namedItem = (n) => arr.find(p => p.name === n) || null;
-        arr.refresh   = () => {};
-        arr.item      = (i) => arr[i];
+        arr.namedItem = _m((n) => arr.find(p => p.name === n) || null, 'namedItem');
+        arr.refresh   = _m(() => {}, 'refresh');
+        arr.item      = _m((i) => arr[i], 'item');
         arr[Symbol.iterator] = Array.prototype[Symbol.iterator];
         return arr;
-    }
+    }, 'get plugins')
 });
 
 // ── 3. navigator.languages ────────────────────────────────────
 Object.defineProperty(navigator, 'languages', {
-    get: () => ['zh-TW', 'zh', 'en-US', 'en'],
+    get: _m(() => ['zh-TW', 'zh', 'en-US', 'en'], 'get languages'),
     configurable: true
 });
 
@@ -190,10 +320,10 @@ if (!window.chrome) {
             PlatformArch: {},
             PlatformOs: {},
             RequestUpdateCheckStatus: {},
-            connect: () => {},
-            sendMessage: () => {}
+            connect: _m(() => {}, 'connect'),
+            sendMessage: _m(() => {}, 'sendMessage')
         },
-        loadTimes: function() {
+        loadTimes: _m(function() {
             return {
                 commitLoadTime: Date.now() / 1000 - Math.random() * 2,
                 connectionInfo: 'h2',
@@ -209,102 +339,102 @@ if (!window.chrome) {
                 wasFetchedViaSpdy: true,
                 wasNpnNegotiated: true
             };
-        },
-        csi: function() {
+        }, 'loadTimes'),
+        csi: _m(function() {
             return { onloadT: Date.now(), pageT: Math.random() * 5000 + 1000, startE: Date.now() - 3000, tran: 15 };
-        }
+        }, 'csi')
     };
 }
 
 // ── 5. permissions API ────────────────────────────────────────
 const _origQuery = window.Permissions && window.Permissions.prototype.query;
 if (_origQuery) {
-    window.Permissions.prototype.query = function(perm) {
+    window.Permissions.prototype.query = _m(function(perm) {
         if (perm.name === 'notifications') {
             return Promise.resolve({ state: Notification.permission });
         }
         return _origQuery.call(this, perm);
-    };
+    }, 'query');
 }
 
 // ── 6. outerHeight / outerWidth ───────────────────────────────
-Object.defineProperty(window, 'outerHeight', { get: () => 1040, configurable: true });
-Object.defineProperty(window, 'outerWidth',  { get: () => 1440, configurable: true });
-Object.defineProperty(window, 'screenY',     { get: () => 23,   configurable: true });
-Object.defineProperty(window, 'screenX',     { get: () => 0,    configurable: true });
+Object.defineProperty(window, 'outerHeight', { get: _m(() => 1040, 'get outerHeight'), configurable: true });
+Object.defineProperty(window, 'outerWidth',  { get: _m(() => 1440, 'get outerWidth'), configurable: true });
+Object.defineProperty(window, 'screenY',     { get: _m(() => 23, 'get screenY'), configurable: true });
+Object.defineProperty(window, 'screenX',     { get: _m(() => 0, 'get screenX'), configurable: true });
 
 // ── 7. Canvas 指紋 ────────────────────────────────────────────
 const _toDataURL = HTMLCanvasElement.prototype.toDataURL;
-HTMLCanvasElement.prototype.toDataURL = function(type, quality) {
+HTMLCanvasElement.prototype.toDataURL = _m(function(type, quality) {
     if (this.width > 10 && this.height > 10) {
         const ctx = this.getContext('2d');
         if (ctx) {
             const _imageData = ctx.getImageData;
-            ctx.getImageData = function(x, y, w, h) {
+            ctx.getImageData = _m(function(x, y, w, h) {
                 const data = _imageData.call(this, x, y, w, h);
                 const noise = 1;
                 for (let i = 0; i < data.data.length; i += 100) {
                     data.data[i] = Math.min(255, data.data[i] + (Math.random() > 0.5 ? noise : -noise));
                 }
                 return data;
-            };
+            }, 'getImageData');
         }
     }
     return _toDataURL.call(this, type, quality);
-};
+}, 'toDataURL');
 
 // ── 8. WebGL 指紋 ─────────────────────────────────────────────
 const _getParam = WebGLRenderingContext.prototype.getParameter;
-WebGLRenderingContext.prototype.getParameter = function(param) {
+WebGLRenderingContext.prototype.getParameter = _m(function(param) {
     if (param === 37445) return 'Intel Inc.';
     if (param === 37446) return 'Intel Iris OpenGL Engine';
     return _getParam.call(this, param);
-};
+}, 'getParameter');
 if (typeof WebGL2RenderingContext !== 'undefined') {
     const _getParam2 = WebGL2RenderingContext.prototype.getParameter;
-    WebGL2RenderingContext.prototype.getParameter = function(param) {
+    WebGL2RenderingContext.prototype.getParameter = _m(function(param) {
         if (param === 37445) return 'Intel Inc.';
         if (param === 37446) return 'Intel Iris OpenGL Engine';
         return _getParam2.call(this, param);
-    };
+    }, 'getParameter');
 }
 
 // ── 9. AudioContext 指紋 ──────────────────────────────────────
 if (typeof AudioContext !== 'undefined') {
     const _createOscillator = AudioContext.prototype.createOscillator;
-    AudioContext.prototype.createOscillator = function() {
+    AudioContext.prototype.createOscillator = _m(function() {
         const osc = _createOscillator.call(this);
         const _origConnect = osc.connect.bind(osc);
-        osc.connect = function(dest) {
+        osc.connect = _m(function(dest) {
             try { return _origConnect(dest); } catch(e) {}
-        };
+        }, 'connect');
         return osc;
-    };
+    }, 'createOscillator');
 }
 
 // ── 10. navigator.connection ──────────────────────────────────
 Object.defineProperty(navigator, 'connection', {
-    get: () => ({
+    get: _m(() => ({
         effectiveType: '4g',
         rtt: 50 + Math.floor(Math.random() * 50),
         downlink: 10,
         saveData: false,
-    }),
+    }), 'get connection'),
     configurable: true
 });
 
 // ── 11. navigator.hardwareConcurrency / deviceMemory ─────────
-Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8,  configurable: true });
-Object.defineProperty(navigator, 'deviceMemory',        { get: () => 8,  configurable: true });
+Object.defineProperty(navigator, 'hardwareConcurrency', { get: _m(() => 8, 'get hardwareConcurrency'), configurable: true });
+Object.defineProperty(navigator, 'deviceMemory',        { get: _m(() => 8, 'get deviceMemory'), configurable: true });
 
 // ── 12. Date.prototype.getTimezoneOffset ─────────────────────
-Date.prototype.getTimezoneOffset = function() { return -480; };
+Date.prototype.getTimezoneOffset = _m(function() { return -480; }, 'getTimezoneOffset');
 
 // ── 13. Notification.permission ──────────────────────────────
 // headless 下預設為 "default"，真實用戶通常是 "denied"
 try {
     Object.defineProperty(Notification, 'permission', {
-        get: () => 'denied',
+        get: _m(() => 'denied', 'get permission'),
         configurable: true
     });
 } catch(e) {}
@@ -312,36 +442,40 @@ try {
 // ── 14. navigator.mediaDevices.enumerateDevices ───────────────
 // headless 下回傳空陣列，真實用戶有麥克風 / 攝影機 / 喇叭
 if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-    navigator.mediaDevices.enumerateDevices = function() {
+    navigator.mediaDevices.enumerateDevices = _m(function() {
         return Promise.resolve([
             { deviceId: 'default', groupId: 'default', kind: 'audioinput',  label: '' },
             { deviceId: 'default', groupId: 'default', kind: 'audiooutput', label: '' },
             { deviceId: 'default', groupId: 'default', kind: 'videoinput',  label: '' },
         ]);
-    };
+    }, 'enumerateDevices');
 }
 
 // ── 15. document.hasFocus ─────────────────────────────────────
 // headless 下永遠回傳 false，真實用戶通常為 true
-document.hasFocus = function() { return true; };
+document.hasFocus = _m(function() { return true; }, 'hasFocus');
 
 // ── 16. performance.memory ────────────────────────────────────
 // headless 下結構異常，注入合理的記憶體使用值
 try {
     Object.defineProperty(performance, 'memory', {
-        get: () => ({
+        get: _m(() => ({
             jsHeapSizeLimit:  2172649472,
             totalJSHeapSize:  Math.floor(Math.random() * 50000000) + 20000000,
             usedJSHeapSize:   Math.floor(Math.random() * 20000000) + 10000000,
-        }),
+        }), 'get memory'),
         configurable: true
     });
 } catch(e) {}
 
 // ── 17. screen.colorDepth / pixelDepth ───────────────────────
 // headless 下可能回傳 24，真實螢幕通常為 24 或 30，明確設定避免異常值
-Object.defineProperty(screen, 'colorDepth', { get: () => 24, configurable: true });
-Object.defineProperty(screen, 'pixelDepth',  { get: () => 24, configurable: true });
+Object.defineProperty(screen, 'colorDepth', { get: _m(() => 24, 'get colorDepth'), configurable: true });
+Object.defineProperty(screen, 'pixelDepth',  { get: _m(() => 24, 'get pixelDepth'), configurable: true });
+
+// ── 收尾：刪除 __mask ────────────────────────────────────────
+// 不刪的話，window.__mask 本身就是一個比 navigator.webdriver 更明顯的自製指紋。
+try { delete window.__mask; } catch(e) { window.__mask = undefined; }
 """
 
 
@@ -395,6 +529,94 @@ async def _human_behavior(page):
         await page.wait_for_timeout(random.randint(300, 800))
 
 
+# ── 互動閘門跨越（只有 HUMAN 做）──────────────────────────────
+# 為什麼這不是外掛補丁，而是「補完既有設計」：
+# 形式模型把可觀測屬性定義為 ℛ = UA × IP × Headers × TLS × JS_props × Behavior，
+# 但先前的實作只做了 Behavior 的一半（滑鼠移動與捲動），沒有點擊。
+# CrawlPhish (IEEE S&P 2021) Table V 統計 User Interaction 類佔客戶端 cloaking
+# 實作的 57.60%（ClickThrough 22.11% / Alert 17.19% / MouseDetection 16.53% /
+# Notification 4.34%），而「BOT 不互動、HUMAN 互動」本身就是一條乾淨的極端化軸。
+#
+# 安全上限（不可放寬）：
+#   ① 絕不點擊 <form> 內的元素或 type=submit —— 分析的是釣魚站，
+#      誤點等於代替受害者把資料送給攻擊者，也可能觸發外部副作用。
+#   ② 絕不解 CAPTCHA。那是 PhishDecloaker 一整篇論文的工作量，
+#      且涉及法律與倫理問題。遇到就讓 Node 4 誠實回報 N/A。
+#   ③ 只點「看起來像閘門」的元素，且最多點一個就停。
+_GATE_TEXTS = [
+    "continue", "proceed", "i am human", "i'm human", "verify", "enter",
+    "click here", "view document", "access", "next",
+    "繼續", "進入", "確認", "查看", "下一步",
+    "続ける", "次へ", "確認する",
+]
+
+# 這些字樣代表「送出資料」而不是「跨越閘門」，即使不在 <form> 內也絕不點
+_FORBIDDEN_TEXTS = [
+    "sign in", "log in", "login", "signin", "submit", "send", "pay", "buy",
+    "confirm payment", "delete", "登入", "登錄", "送出", "提交", "付款", "刪除",
+]
+
+_GATE_PROBE_JS = """(args) => {
+  const [okTexts, badTexts] = args;
+  const cands = document.querySelectorAll(
+    'button, a[role=button], [onclick], input[type=button], div[class*=btn], div[class*=gate]');
+  for (let i = 0; i < cands.length; i++) {
+    const el = cands[i];
+    // ── 安全鎖 ①：表單內元素、submit 一律跳過 ──
+    if (el.closest('form')) continue;
+    const t = (el.getAttribute('type') || '').toLowerCase();
+    if (t === 'submit' || t === 'password') continue;
+    // ── 安全鎖 ②：帶有送出語意的字樣一律跳過 ──
+    const label = (el.innerText || el.value || el.getAttribute('aria-label') || '')
+                    .trim().toLowerCase();
+    if (!label || label.length > 40) continue;
+    if (badTexts.some(b => label.includes(b))) continue;
+    // ── 必須看起來像閘門 ──
+    if (!okTexts.some(k => label.includes(k))) continue;
+    // ── 必須可見且夠大（隱藏元素多半是陷阱或無關）──
+    const r = el.getBoundingClientRect();
+    if (r.width < 24 || r.height < 16) continue;
+    const st = getComputedStyle(el);
+    if (st.display === 'none' || st.visibility === 'hidden' || +st.opacity === 0) continue;
+    el.setAttribute('data-cloakprobe', '1');
+    return { found: true, label: label.slice(0, 40) };
+  }
+  return { found: false };
+}"""
+
+
+async def _cross_gates(page, result: dict):
+    """
+    嘗試跨越一個互動閘門。回傳是否有跨越動作發生（寫入 result['gate_crossed']）。
+    任何失敗都只記錄、不拋出 —— 跨閘門是加分項，不能讓它拖垮整次爬取。
+    """
+    crossed = []
+    # ── alert / confirm：Playwright 預設會自動 dismiss，改成 accept ──
+    # CrawlPhish 統計 Alert 類佔 17.19%，且真人本來就會把 alert 按掉。
+    try:
+        page.on("dialog", lambda d: asyncio.ensure_future(d.accept()))
+        crossed.append("dialog_auto_accept")
+    except Exception as e:
+        logger.debug(f"dialog handler 掛載失敗: {e}")
+
+    # ── click gate ──
+    try:
+        probe = await asyncio.wait_for(
+            page.evaluate(_GATE_PROBE_JS, [_GATE_TEXTS, _FORBIDDEN_TEXTS]), timeout=5.0)
+        if probe and probe.get("found"):
+            el = await page.query_selector("[data-cloakprobe='1']")
+            if el:
+                await el.click(timeout=3000)
+                await page.wait_for_timeout(1800)
+                crossed.append(f"click:{probe.get('label', '')}")
+                logger.debug(f"跨越閘門: {probe.get('label')}")
+    except Exception as e:
+        logger.debug(f"閘門跨越失敗（不影響主流程）: {e}")
+
+    result["gate_crossed"] = crossed
+    return bool(crossed)
+
+
 async def _fetch_with_playwright(url: str, *, is_human: bool) -> dict:
     from playwright.async_api import async_playwright
     try:
@@ -408,8 +630,9 @@ async def _fetch_with_playwright(url: str, *, is_human: bool) -> dict:
         "status_code": 0, "final_url": url, "text_content": "", "html": "",
         "html_length": 0, "redirect_chain": [], "title": "",
         "prewarm_ok": False,
+        "gate_crossed": [],
         "tls_fingerprint": "curl_cffi_chrome" if (is_human and CURL_CFFI_AVAILABLE) else "playwright_chromium",
-        "proxy_used": bool(PROXY_URL),
+        "proxy_used": bool(_proxy_for(is_human)),
         "response_headers": {},   # 新增：擷取關鍵回應標頭供差異比對
         "error": None,
     }
@@ -421,7 +644,8 @@ async def _fetch_with_playwright(url: str, *, is_human: bool) -> dict:
     # 對於只看第一次請求 TLS 指紋的 WAF 尤其有效。
     if CURL_CFFI_AVAILABLE and is_human:
         try:
-            proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+            _px = _proxy_for(is_human)
+            proxies = {"http": _px, "https": _px} if _px else None
             _cffi_requests.get(
                 url,
                 impersonate="chrome120",   # 模擬 Chrome 120 的 JA3/JA4
@@ -462,9 +686,10 @@ async def _fetch_with_playwright(url: str, *, is_human: bool) -> dict:
             ctx_opts = (HUMAN_CONTEXT_OPTIONS if is_human else BOT_CONTEXT_OPTIONS).copy()
 
             # ── 網路層⑧：Proxy 支援 ──────────────────────────
-            if PROXY_URL:
-                ctx_opts["proxy"] = {"server": PROXY_URL}
-                logger.debug(f"Proxy 啟用: {PROXY_URL[:30]}...")
+            _px = _proxy_for(is_human)
+            if _px:
+                ctx_opts["proxy"] = {"server": _px}
+                logger.debug(f"Proxy 啟用 ({'HUMAN' if is_human else 'BOT'}): {_px[:30]}...")
 
             context = await browser.new_context(**ctx_opts, ignore_https_errors=True)
 
@@ -530,6 +755,9 @@ async def _fetch_with_playwright(url: str, *, is_human: bool) -> dict:
                     except Exception:
                         pass
                     await _human_behavior(page)
+                    # 互動閘門：只有 HUMAN 跨，BOT 不跨 ——
+                    # 「爬蟲不互動、真人會互動」本身就是極端化的一個維度
+                    await _cross_gates(page, result)
                     # 優先從 Performance Navigation API 取得最終頁面的真實 HTTP 狀態碼
                     # （跟隨 redirect 後的落點狀態，而非中間 3xx）
                     try:
@@ -670,6 +898,7 @@ def _empty_result(url: str, err: str, is_human: bool) -> dict:
         "error": err, "status_code": 0, "title": "", "text_content": "",
         "html": "", "html_length": 0, "redirect_chain": [], "final_url": url,
         "prewarm_ok": False,
+        "gate_crossed": [],
         "proxy_used": False, "response_headers": {}, "fetch_time_sec": 0,
     }
     if is_human:
@@ -748,3 +977,20 @@ def dual_crawl(url: str) -> tuple:
     print(f"  → [爬取:並行] 總耗時 {wall_time}s"
           f"（序列估計: {bot_time + human_time + stagger:.1f}s）", flush=True)
     return bot_result, human_result, errs
+
+
+def crawl_human_only(url: str) -> dict:
+    """
+    只重爬一次 HUMAN，供 Node 4 的「陽性確認」使用（見 node4 的 C1 確認邏輯）。
+
+    為什麼需要這個：Cloak of Visibility (IEEE S&P 2016) 每個 profile 爬 3 次，
+    用「同 profile 內的變異」正規化「跨 profile 的差異」，目的是排除頁面自身
+    的自然變動（輪播廣告、A/B test、個人化）造成的誤判。
+
+    本系統的判準是離散的機制集合，不是連續相似度，所以不需要全量 3×：
+    只在「即將宣稱有 cloaking 且該結論僅由單次觀測到的機制支撐」時，
+    重爬一次確認機制是否穩定重現即可。成本 = 1 × 陽性率，而非 2×。
+    """
+    if not url:
+        return _empty_result("", "no_url", True)
+    return _timed_fetch(url, True)

@@ -1,8 +1,10 @@
 """
-node3_phishing_classifier.py  判斷是否為釣魚網站（條件路由閘門）
-規則比對 + LLM 雙重判斷，信心度超過閾值才判定為釣魚
-釣魚網站 → Node 4 (Cloaking 分析)
-非釣魚  → Node 5 (風險計算 & 輸出)
+node3_phishing_classifier.py  判斷是否為釣魚網站
+Layer 1 布林裁決（不呼叫 LLM）+ Layer 2 加權累加（LLM 僅在此層以極大值融合參與）
+
+這個節點「不是」閘門：釣魚與 cloaking 是兩個獨立屬性，各自判定、不互為前提，
+圖是線性的（見 main.py build_graph）。無論本節點判定為何，都會進 Node 4。
+本節點的 evaluate_page() 同時是 Node 4 比對兩份頁面所用的共享判斷函數 φ。
 """
 import sys as _sys
 import os as _os

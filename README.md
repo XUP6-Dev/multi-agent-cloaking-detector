@@ -17,38 +17,6 @@
 
 ---
 
-## Pipeline
-
-```mermaid
-flowchart TD
-    URL(["URL"]) --> N1
-
-    subgraph N1["Node 1 · 雙重爬取（並行，錯開 2–4 秒）"]
-        direction TB
-        BOT["BOT 身分\nGooglebot UA・webdriver=true\nplugins=[]・無 Accept-Language"]
-        HUMAN["HUMAN 身分\nChrome UA・15 項 stealth 修補\n貝茲曲線滑鼠・Google session 預熱"]
-    end
-
-    N1 -- "bot_crawl / human_crawl\nraw_html = HUMAN（失敗才退 BOT→靜態 fallback）\njs_scripts（從判定用頁面抽取）" --> N2["Node 2 · JS 去混淆\n8 種手法＋LLM 分塊迭代\n（obfuscation_score > 0.45 才觸發）"]
-    N2 -- "deobfuscated_js" --> N3["Node 3 · 釣魚判定（對 HUMAN 頁）\nLayer 1 布林裁決 D1–D7　命中即定案 ⇒\nLayer 2 加權累加（閾值 0.45）"]
-    N3 -- "is_phishing" --> N4["Node 4 · Cloaking 判定\n靜態 S1–S4（前端 JS 布林）\n動態 C1–C5（BOT vs HUMAN 機制集合差）\nevaluate_page() 與 Node 3 共用"]
-    N4 -- "cloaking_verified\nCONFIRMED / SUSPECTED / AMBIGUOUS" --> N5["Node 5 · 輸出\nurl・is_phishing・cloaking"]
-    N5 --> OUT(["CSV 報告\ncloaking ∈ True / False / N-A"])
-
-    classDef bot fill:#4a1c1c,stroke:#c0392b,color:#fff
-    classDef human fill:#1c3a1c,stroke:#27ae60,color:#fff
-    classDef node fill:#1c2a4a,stroke:#3498db,color:#fff
-    classDef term fill:#2c2c2c,stroke:#888,color:#fff
-    class BOT bot
-    class HUMAN human
-    class N2,N3,N4,N5 node
-    class URL,OUT term
-```
-
-線性，**沒有條件路由**。釣魚與 cloaking 是 2×2 的兩個獨立屬性，任何前後閘門都會讓其中一格變成「未測量」。
-
----
-
 ## Node 1 — 雙重爬取
 
 `nodes/node1_scraper.py` + `nodes/dual_crawler.py`
@@ -58,11 +26,27 @@ flowchart TD
 | | 偽裝方向 | 手段 |
 |---|---|---|
 | **BOT** | 主動暴露自己是機器人 | Googlebot UA、`_BOT_EXPOSE_JS` 把 `webdriver=true`/`plugins=[]`/`languages=[]` 全部還原、1024×768、無 `Accept-Language`、保留 `AutomationControlled` 旗標 |
-| **HUMAN** | 盡可能像真人 | `_STEALTH_JS` 修補 15 個 headless 洩漏點、Canvas/WebGL/Audio 假指紋、Google session 預熱、貝茲曲線滑鼠軌跡 |
+| **HUMAN** | 盡可能像真人 | `_STEALTH_JS` 修補 17 個 headless 洩漏點＋原生函式 toString 遮蔽、Canvas/WebGL/Audio 假指紋、Google session 預熱、貝茲曲線滑鼠軌跡、**互動閘門跨越** |
 
 **輸出**：`bot_crawl` / `human_crawl`（同結構 dict）、`raw_html` = **HUMAN 那份**（HUMAN 失敗才退回 BOT，再失敗才 `requests` fallback）、`js_scripts`（從判定用頁面抽取）。
 
-可選增強：`CLOAKING_PROXY` 環境變數走住宅代理、裝 `curl_cffi` 讓 TLS JA3/JA4 指紋像真 Chrome。
+可選增強：`CLOAKING_PROXY_BOT` / `CLOAKING_PROXY_HUMAN` 讓兩端走不同出口（IP 也成為分離維度）、裝 `curl_cffi` 讓 TLS JA3/JA4 指紋像真 Chrome。
+
+**HUMAN profile 可切換**（`HUMAN_PROFILE` 環境變數）：`tw-desktop`（預設）/ `jp-mobile` / `jp-desktop` / `us-desktop` / `jp-mac-safari`。
+
+**互動閘門跨越（只有 HUMAN 做）**：自動接受 alert/confirm、點擊一個「看起來像閘門」的按鈕。
+
+這不是外掛補丁而是補完既有設計——形式模型的 ℛ 本來就包含 `Behavior` 維度，先前只做了一半（滑鼠移動、捲動），沒有點擊。CrawlPhish Table V 統計 User Interaction 類佔客戶端 cloaking 的 **57.60%**，而「爬蟲不互動、真人會互動」本身就是一條乾淨的極端化軸。
+
+安全上限（不可放寬，有測試把關）：
+1. **絕不點 `<form>` 內元素或 `type=submit`**——分析的是釣魚站，誤點等於代替受害者把資料送給攻擊者。
+2. **絕不點帶送出語意的字樣**（sign in / submit / pay / 登入 / 送出 / 付款），即使不在表單內。
+3. **絕不解 CAPTCHA**——法律與倫理問題，且是 PhishDecloaker 一整篇論文的工作量。遇到就讓 Node 4 回報 `N/A`。
+4. 只點可見、夠大、字樣像閘門的元素，最多點一個。
+
+已跨越的閘門不再計入「沒看到內容」（否則加了這功能反而更多案例掉進 `N/A`）；CAPTCHA 永遠算未跨越。
+
+極端化處理的是「bot ↔ human」軸，但 PhishParrot（GLOBECOM'25）實測攻擊者的 targeting 大量發生在**正交的地理／平台軸**上（91 種最佳 profile；日本住宅網路 53.83%、美國資料中心 30.71%、macOS Safari + 日本住宅 8.77%）。所以本系統的主張不是「兩個 profile 就能觸及所有 cloaked 內容」，而是**「一組極端化的配對是做出 cloaking 判定的最小單位」**——profile 的『選擇』與『差分』可分離，前者可由 PhishParrot 式最佳化供給，後者不受影響。
 
 ---
 
@@ -137,11 +121,19 @@ hidden_from_bot = evaluate_page(HUMAN).mechanisms − evaluate_page(BOT).mechani
 
 明確區分三種「不是 cloaking」：兩端都有惡意機制（是釣魚但沒藏）、兩端都乾淨、分叉但機制相同（地理導向）。
 
+**C1 陽性確認**：只有 C1 依賴「單次觀測到的機制」，所以 C1 單獨成立時會重爬一次 HUMAN，確認機制穩定重現才維持判定；沒重現就判為頁面自身變異（輪播／A-B test／個人化）並撤銷。C2–C5 依據狀態碼、傳輸層錯誤、空頁面、redirect 鏈，都是當次事實，不重爬。
+
+對照 Cloak of Visibility（S&P'16）每個 profile 全量爬 3 次算變異度基線——因為我們比的是離散機制集合而非連續相似度，成本從 3× 降為 `1 × 陽性率`。重爬失敗時保守維持原判定，不讓網路問題製造漏報。
+
 **為什麼不用文字相似度**：相似度低 ≠ cloaking（多語言、A/B test、個人化）；相似度高 ≠ 沒有 cloaking（只塞一支外洩腳本可以到 0.98）。相似度仍然計算並列印，但標記「不參與判定」。
 
 ### 可信度分級
 
 `CONFIRMED`（雙瀏覽器可信 + 實驗確認）/ `SUSPECTED`（單側證據或動態不可信）/ `AMBIGUOUS`（兩端一致且可信 → 沒有 cloaking）。
+
+降級為 `LOW` 的四個條件：任一端 error、HUMAN 耗時過短、預熱失敗，以及**兩端皆無機制但頁面存在未跨越的互動閘門**（CAPTCHA / alert / notification / click gate）。
+
+最後一條是必要的：CrawlPhish（S&P'21）Table V 統計 User Interaction 類佔客戶端 cloaking 實作的 **57.60%**，而爬蟲不點擊、不關 alert、不解 CAPTCHA —— 兩端都停在閘門前，機制集合差為空，但爬取本身「很健康」會拿到 `HIGH`，於是輸出 `False`，等於謊稱「驗過了，確認沒有 cloaking」。**對稱的「看不到」不能當成對稱的「沒有」**，這種情況必須回報 `N/A`。
 
 ---
 
@@ -184,7 +176,9 @@ python main.py
 | `LLM_PROVIDER` | `lmstudio`（預設）/ `deepseek` / `anthropic` / `openai` / `google` |
 | `<PROVIDER>_API_KEY` | 對應的 key；未設定則所有 LLM 節點退化為純規則模式（`lmstudio` 例外，見下）|
 | `LLM_MODEL` | 覆寫預設模型 |
-| `CLOAKING_PROXY` | 住宅代理（可選） |
+| `CLOAKING_PROXY` | 兩端共用的代理（可選） |
+| `CLOAKING_PROXY_BOT` / `CLOAKING_PROXY_HUMAN` | 分別設定，讓 **IP 也成為極端化維度**；未設定則沿用 `CLOAKING_PROXY` |
+| `HUMAN_PROFILE` | `tw-desktop`（預設）/ `jp-mobile` / `jp-desktop` / `us-desktop` / `jp-mac-safari` |
 
 ⚠️ Claude 5 系列已移除 `temperature` / `top_p` / `top_k`，送出直接回 400 —— `_make_llm` 依供應商決定要不要帶。
 
@@ -214,7 +208,7 @@ python main.py
 python test_node3_phishing.py && python test_node4_cloaking.py && python test_node4_static.py && python test_pipeline_e2e.py
 ```
 
-23 個測試。`test_pipeline_e2e.py` 把 `dual_crawl` 換成假結果，不連網跑完整條 graph。
+35 個測試。`test_pipeline_e2e.py` 把 `dual_crawl` 換成假結果，不連網跑完整條 graph。
 
 ## 檔案
 
@@ -222,11 +216,11 @@ python test_node3_phishing.py && python test_node4_cloaking.py && python test_no
 |---|---|---|
 | `main.py` | 579 | LangGraph 組裝、LLM 供應商工廠（5 種）、批次執行、CLI |
 | `state.py` | 26 | `AnalysisState` TypedDict |
-| `nodes/dual_crawler.py` | 750 | BOT/HUMAN Playwright 爬取層 |
+| `nodes/dual_crawler.py` | 996 | BOT/HUMAN Playwright 爬取層 |
 | `nodes/node1_scraper.py` | 179 | 呼叫雙重爬取、抽 JS |
 | `nodes/node2_js_analyzer.py` | 355 | 去混淆 |
 | `nodes/node3_phishing_classifier.py` | 1191 | 釣魚判準（`evaluate_page` 為共用入口）|
-| `nodes/node4_cloaking_analyzer.py` | 669 | 靜態 + 動態 cloaking 判定 |
+| `nodes/node4_cloaking_analyzer.py` | 788 | 靜態 + 動態 cloaking 判定 |
 | `nodes/node5_risk_output.py` | 97 | 三欄 CSV 輸出 |
 
 （`nodes/__init__.py` 16 行，純匯出，不列職責）
@@ -235,7 +229,10 @@ python test_node3_phishing.py && python test_node4_cloaking.py && python test_no
 
 ## 已知限制
 
-1. **Node 4 的機制比對吃原始 HTML，不吃去混淆結果。** 兩端對等，但混淆過的釣魚頁可能兩端都測不出機制（`code_obfuscation_exec` 這個 flag 部分擋住）。修法是對兩份 HTML 都跑去混淆，代價是 LLM 成本 ×2。
-2. **HTML/JS 規則的權重與門檻無資料依據。** `Dataset.csv` 只有 URL 欄位，能校準的只有 Node 3 的詞彙層。
-3. **Node 2 的 LLM 去混淆（timeout 240s）是剩下最貴的一塊**，且它是唯一擋住 Node 3/4 平行化的依賴。
-4. **`PHISHING_CONFIDENCE_THRESHOLD = 0.45` 是全系統唯一剩下的魔術數字。** 可以用 `Dataset.csv` 校準，做法同 WoE 那次。
+1. **CAPTCHA 類閘門仍看不到。** click / alert 類已可跨越，但 CAPTCHA 刻意不破解 → 兩端對稱看不到內容，誠實回報 `N/A`。跨閘門的啟發式也只點「字樣像閘門」的元素，非典型措辭的閘門會漏。
+2. **IP 維度預設沒有極端化。** 已可用 `CLOAKING_PROXY_BOT` / `CLOAKING_PROXY_HUMAN` 分離，但**未設定時兩端仍共用出口**，此時純 IP-based cloaking 對這個差分是全盲的。
+3. **單次執行只用一個 HUMAN profile。** 已可用 `HUMAN_PROFILE` 切換五種預設，但一次跑只覆蓋一種；針對其他地區／平台的 kit 仍會把 HUMAN 判為非目標 → 兩端對稱 → 漏報。要完整覆蓋需跑多個 profile 再取聯集，成本線性增加。
+4. **Node 4 的機制比對吃原始 HTML，不吃去混淆結果。** 兩端對等，但混淆過的釣魚頁可能兩端都測不出機制（`code_obfuscation_exec` 這個 flag 部分擋住）。修法是對兩份 HTML 都跑去混淆，代價是 LLM 成本 ×2。
+5. **HTML/JS 規則的權重與門檻無資料依據。** `Dataset.csv` 只有 URL 欄位，能校準的只有 Node 3 的詞彙層。
+6. **Node 2 的 LLM 去混淆（timeout 240s）是剩下最貴的一塊**，且它是唯一擋住 Node 3/4 平行化的依賴。
+7. **`PHISHING_CONFIDENCE_THRESHOLD = 0.45` 是全系統唯一剩下的魔術數字。** 可以用 `Dataset.csv` 校準，做法同 WoE 那次。

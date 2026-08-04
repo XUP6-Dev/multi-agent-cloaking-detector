@@ -14,6 +14,13 @@ from typing import Dict, Any, List
 from datetime import datetime
 from pathlib import Path
 
+# ── 主控台編碼 ────────────────────────────────────────────────
+# Windows 預設主控台編碼常是 cp950/cp936，印出 emoji（⚠️✅🔍…）會直接
+# UnicodeEncodeError 讓整支程式中斷。強制 stdout/stderr 用 UTF-8。
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+
 # ── 路徑修正 ──────────────────────────────────────────────────
 # 確保不論從何處執行，都能找到同目錄的模組
 # IDE（Pylance/Pyright）紅線問題請參考 pyrightconfig.json 與 .vscode/settings.json
@@ -78,6 +85,7 @@ import time
 # ⚠️ Claude 5 系列（claude-opus-5 / claude-sonnet-5）已移除 temperature /
 #   top_p / top_k —— 送出會直接回 400。舊的 _make_llm 寫死 temperature=0，
 #   直接接上去會全部失敗，所以工廠依供應商決定要不要帶這個參數。
+
 LLM_PROVIDERS = {
     "deepseek": {
         "env_key": "DEEPSEEK_API_KEY",
@@ -116,11 +124,11 @@ LLM_PROVIDERS = {
     },
 }
 
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "deepseek").lower()
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "lmstudio").lower()
 if LLM_PROVIDER not in LLM_PROVIDERS:
     print(f"\n[!] 未知的 LLM_PROVIDER='{LLM_PROVIDER}'，"
-          f"可用: {', '.join(LLM_PROVIDERS)}；退回 deepseek\n")
-    LLM_PROVIDER = "deepseek"
+          f"可用: {', '.join(LLM_PROVIDERS)}；退回 lmstudio\n")
+    LLM_PROVIDER = "lmstudio"
 
 _PROVIDER  = LLM_PROVIDERS[LLM_PROVIDER]
 MODEL_NAME = os.environ.get("LLM_MODEL", _PROVIDER["default"])
@@ -291,6 +299,7 @@ def create_initial_state(url: str) -> AnalysisState:
         phishing_indicators=[], cloaking_detected=False, cloaking_techniques=[],
         cloaking_verified=False,
         cloaking_confidence_tier="AMBIGUOUS", dual_crawl_results={},
+        static_is_fallback=False,
         report="", errors=[]
     )
 
